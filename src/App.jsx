@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 import './App.css'
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf';
 import { PDFDocument, StandardFonts } from 'pdf-lib';
+import axios from 'axios';
 
 function App() {
   const [file, setFile] = useState(null)
@@ -10,6 +11,9 @@ function App() {
   const [redactedFileUrl, setRedactedFileUrl] = useState(null)
   const [fileText, setFileText] = useState('')
   const [downloadAsPdf, setDownloadAsPdf] = useState(false)
+  const [useGemini, setUseGemini] = useState(false)
+  const [redactedText, setRedactedText] = useState('')
+  const [redactedItems, setRedactedItems] = useState([])
 
   // Helper: Extract text from PDF using pdfjs-dist
   const extractTextFromPDF = async (file) => {
@@ -50,17 +54,102 @@ function App() {
     }
   };
 
-  // Regex-based PII redaction
-  const redactPII = (text) => {
+  // Regex-based PII redaction (now tracks what was removed)
+  const redactPII = (text, options = { email: true, phone: true, name: true, address: true }, labelStyle = 'default') => {
+    let redacted = text;
+    const items = [];
+    let emailCount = 1, phoneCount = 1, nameCount = 1, addressCount = 1;
     // Email
-    let redacted = text.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[REDACTED EMAIL]');
-    // Phone (simple, international and local)
-    redacted = redacted.replace(/(\+\d{1,3}[-.\s]?)?(\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4,6}/g, '[REDACTED PHONE]');
+    if (options.email) {
+      redacted = redacted.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, (match) => {
+        items.push({ type: 'Email', value: match, reason: 'Matched regex for email' });
+        return labelStyle === 'numbered' ? `[EMAIL_${emailCount++}]` : '[REDACTED EMAIL]';
+      });
+    }
+    // Phone
+    if (options.phone) {
+      redacted = redacted.replace(/(\+\d{1,3}[-.\s]?)?(\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4,6}/g, (match) => {
+        items.push({ type: 'Phone', value: match, reason: 'Matched regex for phone' });
+        return labelStyle === 'numbered' ? `[PHONE_${phoneCount++}]` : '[REDACTED PHONE]';
+      });
+    }
     // Name (very basic, capitalized words, not perfect)
-    redacted = redacted.replace(/\b([A-Z][a-z]+\s[A-Z][a-z]+)\b/g, '[REDACTED NAME]');
+    if (options.name) {
+      redacted = redacted.replace(/\b([A-Z][a-z]+\s[A-Z][a-z]+)\b/g, (match) => {
+        items.push({ type: 'Name', value: match, reason: 'Matched regex for name' });
+        return labelStyle === 'numbered' ? `[NAME_${nameCount++}]` : '[REDACTED NAME]';
+      });
+    }
     // Address (very basic, numbers followed by street, not perfect)
-    redacted = redacted.replace(/\b\d{1,5}\s+([A-Za-z0-9.,\s]+(Street|St|Avenue|Ave|Road|Rd|Lane|Ln|Blvd|Boulevard|Drive|Dr|Court|Ct)\b)/gi, '[REDACTED ADDRESS]');
+    if (options.address) {
+      redacted = redacted.replace(/\b\d{1,5}\s+([A-Za-z0-9.,\s]+(Street|St|Avenue|Ave|Road|Rd|Lane|Ln|Blvd|Boulevard|Drive|Dr|Court|Ct)\b)/gi, (match) => {
+        items.push({ type: 'Address', value: match, reason: 'Matched regex for address' });
+        return labelStyle === 'numbered' ? `[ADDRESS_${addressCount++}]` : '[REDACTED ADDRESS]';
+      });
+    }
+    setRedactedItems(items);
     return redacted;
+  };
+
+  // Gemini LLM-based PII detection (now tracks what was removed)
+  const redactPIIWithGemini = async (text) => {
+    if (!apiKey) {
+      setStatus('Gemini API key required for LLM redaction.');
+      return text;
+    }
+    setStatus('Contacting Gemini for PII detection...');
+    const prompt = `Find and return all personally identifiable information (PII) in the following text as a JSON array of objects with 'text' and 'type'. Only return the JSON array.\n\n${text}`;
+    try {
+      const response = await axios.post(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent',
+        {
+          contents: [
+            {
+              parts: [
+                { text: prompt }
+              ]
+            }
+          ]
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          }
+        }
+      );
+      // Parse Gemini's response
+      const candidates = response.data.candidates || [];
+      let piiList = [];
+      for (const cand of candidates) {
+        const content = cand.content?.parts?.[0]?.text || '';
+        try {
+          // Try to extract JSON array from the response
+          const match = content.match(/\[.*\]/s);
+          if (match) {
+            const arr = JSON.parse(match[0]);
+            piiList = piiList.concat(arr);
+          }
+        } catch (e) { /* ignore parse errors */ }
+      }
+      // Redact all detected PII
+      let redacted = text;
+      const items = [];
+      if (piiList.length > 0) {
+        piiList.forEach((pii, idx) => {
+          if (pii.text) {
+            items.push({ type: pii.type || 'PII', value: pii.text, reason: 'LLM detected as ' + (pii.type || 'PII') });
+            const safeText = pii.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            redacted = redacted.replace(new RegExp(safeText, 'g'), `[REDACTED ${pii.type ? pii.type.toUpperCase() : 'PII'}_${idx + 1}]`);
+          }
+        });
+      }
+      setRedactedItems(items);
+      return redacted;
+    } catch (err) {
+      setStatus('Gemini API error. Falling back to regex redaction.');
+      return redactPII(text);
+    }
   };
 
   // Generate a PDF file from redacted text using pdf-lib
@@ -112,7 +201,13 @@ function App() {
       return;
     }
     setStatus('Redacting PII...');
-    const redacted = redactPII(fileText);
+    let redacted;
+    if (useGemini && apiKey) {
+      redacted = await redactPIIWithGemini(fileText);
+    } else {
+      redacted = redactPII(fileText);
+    }
+    setRedactedText(redacted);
     setStatus('PII redacted. Ready to download.');
     let url;
     if (downloadAsPdf) {
@@ -165,6 +260,16 @@ function App() {
         <label>
           <input
             type="checkbox"
+            checked={useGemini}
+            onChange={e => setUseGemini(e.target.checked)}
+          />
+          Use Gemini LLM for PII detection
+        </label>
+      </div>
+      <div className="input-section">
+        <label>
+          <input
+            type="checkbox"
             checked={downloadAsPdf}
             onChange={e => setDownloadAsPdf(e.target.checked)}
           />
@@ -178,6 +283,45 @@ function App() {
       <div className="status-section">
         <p>{status}</p>
       </div>
+
+      {/* Show original and redacted text */}
+      {fileText && (
+        <div style={{ display: 'flex', gap: '2rem', marginTop: '2rem', alignItems: 'flex-start' }}>
+          <div style={{ flex: 1 }}>
+            <h3>Original Text</h3>
+            <pre style={{ background: '#f4f4f4', padding: '1rem', borderRadius: '6px', maxHeight: 300, overflow: 'auto' }}>{fileText}</pre>
+          </div>
+          <div style={{ flex: 1 }}>
+            <h3>Redacted Text</h3>
+            <pre style={{ background: '#f4f4f4', padding: '1rem', borderRadius: '6px', maxHeight: 300, overflow: 'auto' }}>{redactedText}</pre>
+          </div>
+        </div>
+      )}
+
+      {/* Show what was removed */}
+      {redactedItems.length > 0 && (
+        <div style={{ marginTop: '2rem' }}>
+          <h3>Redacted Items</h3>
+          <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
+            <thead>
+              <tr>
+                <th style={{ border: '1px solid #ddd', padding: '8px' }}>Type</th>
+                <th style={{ border: '1px solid #ddd', padding: '8px' }}>Value</th>
+                <th style={{ border: '1px solid #ddd', padding: '8px' }}>Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {redactedItems.map((item, idx) => (
+                <tr key={idx}>
+                  <td style={{ border: '1px solid #ddd', padding: '8px' }}>{item.type}</td>
+                  <td style={{ border: '1px solid #ddd', padding: '8px', color: '#b91c1c' }}>{item.value}</td>
+                  <td style={{ border: '1px solid #ddd', padding: '8px', color: '#555' }}>{item.reason}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   )
 }
